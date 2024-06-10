@@ -1,0 +1,3 @@
+# pg_dropcache extension
+comment = 'simulates hot and cold start'
+default_version = '0.0.1'
