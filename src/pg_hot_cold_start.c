@@ -3,6 +3,7 @@
 #include "fmgr.h"
 #include "executor/executor.h"
 #include "utils/rel.h"
+#include "utils/guc.h"
 
 #include "access/relation.h"
 
@@ -12,6 +13,10 @@
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
+
+extern Oid MyDatabaseId;
+extern Oid MyDatabaseTableSpace;
+extern ProcNumber MyProcNumber;
 
 /* GUC Variable */
 static char *experiment_mode = NULL;
@@ -26,6 +31,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
     Oid relOid;
     Oid indexOid;
     Oid bitOid;
+    Oid indexOnlyOid;
 
     /* Check if planTree is empty to check if tree traversed (recursion) */
     if (planTree == NULL)
@@ -39,8 +45,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
      * For relations, check if node represents a sequential scan. If so, retrieve the
      * relOid and stores it in a list (oidList).
      *
-     * For indexes, check for the type of index and directly store its ID in the oidList, since
-     * no RangeTable indirection.
+     * For indexes, check for the type of index and retrieve its ID over the scan.id. Store this in the oidList.
      *
      * The oidList is later passed to the prewarm function for further processing.
      */
@@ -56,18 +61,39 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
     else if (planTree->type == T_IndexScan)
     {
         IndexScan *indexScan = (IndexScan *)planTree;
-        elog(INFO, "Scanning index with OID: %d", indexScan->indexid);
+        elog(INFO, "Scanning index: %d", indexScan->indexid);
         indexOid = indexScan->indexid;
-        *oidList = lappend_oid(*oidList, indexOid);
+
+        // Get relations from index
+        rte = list_nth(queryDesc->plannedstmt->rtable, indexScan->scan.scanrelid - 1);
+        relOid = rte->relid;
+        elog(INFO, "Scanning relation with OID: %d from index: %d", relOid, indexOid);
+        *oidList = lappend_oid(*oidList, relOid);
     }
     else if (planTree->type == T_BitmapIndexScan)
     {
         BitmapIndexScan *bitmapIndexScan = (BitmapIndexScan *)planTree;
         elog(INFO, "Scanning bitmap index with OID: %d", bitmapIndexScan->indexid);
         bitOid = bitmapIndexScan->indexid;
-        *oidList = lappend_oid(*oidList, bitOid);
-    }
 
+        // Get relations from bitmap index
+        rte = list_nth(queryDesc->plannedstmt->rtable, bitmapIndexScan->scan.scanrelid - 1);
+        relOid = rte->relid;
+        elog(INFO, "Scanning relation with OID: %d from index: %d", relOid, bitOid);
+        *oidList = lappend_oid(*oidList, relOid);
+    }
+    else if (planTree->type == T_IndexOnlyScan)
+    {
+        IndexOnlyScan *indexOnlyScan = (IndexOnlyScan *)planTree;
+        elog(INFO, "Scanning index only scan with OID: %d", indexOnlyScan->indexid);
+        indexOnlyOid = indexOnlyScan->indexid;
+
+        // Get relations from index only scan index
+        rte = list_nth(queryDesc->plannedstmt->rtable, indexOnlyScan->scan.scanrelid - 1);
+        relOid = rte->relid;
+        elog(INFO, "Scanning relation with OID: %d from index: %d", relOid, indexOnlyOid);
+        *oidList = lappend_oid(*oidList, relOid);
+    }
     /* Recursively walk through the tree and its children, pass the List */
     get_relations_from_plan(queryDesc, planTree->lefttree, oidList);
     get_relations_from_plan(queryDesc, planTree->righttree, oidList);
@@ -92,7 +118,7 @@ static void prewarm_relations(unsigned int relOid)
     // Get the number of blocks
     nblocks = RelationGetNumberOfBlocks(rel);
 
-    elog(INFO, "Number of blocks in relation: %u", nblocks);
+    elog(INFO, "Number of blocks in relation: %u / %u", nblocks, MaxBlockNumber);
 
     for (blkno = 0; blkno < nblocks; blkno++)
     {
@@ -108,16 +134,41 @@ static void prewarm_relations(unsigned int relOid)
 }
 
 /*
-static void empty_buffer()
+static void evict_relation(unsigned int relOid)
 {
+    SMgrRelation smgr_reln;
+    SMgrRelation smgr_relns[1];  // Create an array of SMgrRelation pointers
+    RelFileLocator rfl;
+
+    rfl.relNumber = relOid;
+    rfl.dbOid = MyDatabaseId;
+    rfl.spcOid = MyDatabaseTableSpace;
+
+    smgr_reln = smgropen(rfl, MyProcNumber);
+    smgr_relns[0] = smgr_reln;  // Add the SMgrRelation to the array
+
+    elog(INFO, "Evict relaation with OID: %d from table %d and tablespace %d", rfl.relNumber, rfl.dbOid, rfl.spcOid);
+
+    DropRelationsAllBuffers(smgr_relns, 1);  // Pass the array instead of the single pointer
+
+    smgrclose(smgr_reln);
 }
 */
+
+static void evict_relation()
+{
+    elog(INFO, "Emptied buffer for database: %d", MyDatabaseId);
+    DropDatabaseBuffers(MyDatabaseId);
+}
 
 /* Actual extension starting point */
 static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction, uint64 count, bool execute_once)
 {
     Plan *planTree = queryDesc->plannedstmt->planTree;
     List *oidList = NIL;
+
+    /* Get the relations to be prewarmed out of the query plan */
+    get_relations_from_plan(queryDesc, planTree, &oidList);
 
     /*
      * HOT START
@@ -126,8 +177,6 @@ static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction,
 
     if (strcmp(experiment_mode, "hot") == 0)
     {
-        /* Get the relations to be prewarmed out of the query plan */
-        get_relations_from_plan(queryDesc, planTree, &oidList);
 
         /* Check content of OID List */
         if (list_length(oidList) != 0)
@@ -137,7 +186,7 @@ static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction,
                 elog(INFO, "List Content OID: %d", list_nth_oid(oidList, i));
             }
         }
-        /* Iterate over OIDList and prewarm each relation or index from it */
+        /* Iterate over OIDList and prewarm each relation from it */
         for (int i = 0; i < list_length(oidList); i++)
         {
             prewarm_relations(list_nth_oid(oidList, i));
@@ -150,8 +199,19 @@ static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction,
      */
 
     if (strcmp(experiment_mode, "cold") == 0)
+        /*
+        {
+            for (int i = 0; i < list_length(oidList); i++)
+            {
+                evict_relation(list_nth_oid(oidList, i));
+            }
+        }
+         */
+        evict_relation();
+
+    if (strcmp(experiment_mode, "off") == 0)
     {
-        /* Empty the buffer */
+        elog(INFO, "Extension turned off");
     }
 
     return pg_exec_run_prev_hook(queryDesc, direction, count, execute_once);
@@ -167,7 +227,7 @@ void _PG_init(void)
         "Activate either cold or hot start.",
         NULL,
         &experiment_mode,
-        "hot", /* default value */
+        "cold", /* default value */
         PGC_SUSET,
         0,
         NULL,
