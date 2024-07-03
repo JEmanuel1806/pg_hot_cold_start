@@ -1,7 +1,7 @@
 #include "postgres.h"
 #include "utils/guc.h"
 #include "fmgr.h"
-#include "executor/executor.h"
+#include "optimizer/planner.h"
 #include "utils/rel.h"
 #include "utils/guc.h"
 
@@ -22,10 +22,10 @@ extern ProcNumber MyProcNumber;
 static char *experiment_mode = NULL;
 
 /* Used Hook */
-static ExecutorRun_hook_type pg_exec_run_prev_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
 /* Traverse query plan tree and get all relevant relations */
-static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List **oidList)
+static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList)
 {
     RangeTblEntry *rte;
     Oid relOid;
@@ -55,7 +55,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
     case T_SeqScan:
     {
         Scan *scan = (Scan *)planTree;
-        rte = list_nth(queryDesc->plannedstmt->rtable, scan->scanrelid - 1);
+        rte = list_nth(query->rtable, scan->scanrelid - 1);
         relOid = rte->relid;
 
         elog(INFO, "Scanning relation: %s", rte->eref->aliasname);
@@ -65,7 +65,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
     case T_BitmapHeapScan:
     {
         Scan *scan = (Scan *)planTree;
-        rte = list_nth(queryDesc->plannedstmt->rtable, scan->scanrelid - 1);
+        rte = list_nth(query->rtable, scan->scanrelid - 1);
         relOid = rte->relid;
 
         elog(INFO, "Bitmap Heap Scan with relation: %s", rte->eref->aliasname);
@@ -78,7 +78,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
         indexOid = indexScan->indexid;
 
         // Get relations from index
-        rte = list_nth(queryDesc->plannedstmt->rtable, indexScan->scan.scanrelid - 1);
+        rte = list_nth(query->rtable, indexScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from index scan: %d", rte->eref->aliasname, indexOid);
         *oidList = lappend_oid(*oidList, relOid);
@@ -90,7 +90,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
         bitOid = bitmapIndexScan->indexid;
 
         // Get relations from bitmap index
-        rte = list_nth(queryDesc->plannedstmt->rtable, bitmapIndexScan->scan.scanrelid - 1);
+        rte = list_nth(query->rtable, bitmapIndexScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from Bitmap index: %d", rte->eref->aliasname, bitOid);
         *oidList = lappend_oid(*oidList, relOid);
@@ -102,7 +102,7 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
         indexOnlyOid = indexOnlyScan->indexid;
 
         // Get relations from index only scan index
-        rte = list_nth(queryDesc->plannedstmt->rtable, indexOnlyScan->scan.scanrelid - 1);
+        rte = list_nth(query->rtable, indexOnlyScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from index only scan: %d", rte->eref->aliasname, indexOnlyOid);
         *oidList = lappend_oid(*oidList, relOid);
@@ -116,8 +116,8 @@ static void get_relations_from_plan(QueryDesc *queryDesc, Plan *planTree, List *
     }
 
     /* Recursively walk through the tree and its children, pass the List */
-    get_relations_from_plan(queryDesc, planTree->lefttree, oidList);
-    get_relations_from_plan(queryDesc, planTree->righttree, oidList);
+    get_relations_from_plan(query, planTree->lefttree, oidList);
+    get_relations_from_plan(query, planTree->righttree, oidList);
 }
 
 static void prewarm_relations(unsigned int relOid)
@@ -179,9 +179,20 @@ static void evict_relation()
     DropDatabaseBuffers(MyDatabaseId);
 }
 
-/* Actual extension starting point */
-static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction, uint64 count, bool execute_once)
+static PlannedStmt *
+pg_query_planner_hook(Query *parse, int cursorOptions, const char *query_string, ParamListInfo boundParams)
 {
+    // Call the previous planner hook if it exists, otherwise call standard_planner
+    PlannedStmt *result = NULL;
+
+    if (prev_planner_hook)
+    {
+        result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+    }
+    else
+    {
+        result = standard_planner(parse, query_string, cursorOptions, boundParams);
+    };
 
     /*
      * HOT START
@@ -191,11 +202,11 @@ static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction,
     if (strcmp(experiment_mode, "hot") == 0)
     {
 
-        Plan *planTree = queryDesc->plannedstmt->planTree;
+        Plan *planTree = result->planTree;
         List *oidList = NIL;
 
         /* Get the relations to be prewarmed out of the query plan */
-        get_relations_from_plan(queryDesc, planTree, &oidList);
+        get_relations_from_plan(parse, planTree, &oidList);
 
         /* Check content of OID List */
         if (list_length(oidList) != 0)
@@ -211,35 +222,21 @@ static void pg_query_pre_run_hook(QueryDesc *queryDesc, ScanDirection direction,
             prewarm_relations(list_nth_oid(oidList, i));
         }
     }
-
-    /*
-     * COLD START
-     * Get the relations and indices from the query plan tree and prewarm each of them
-     */
-
-    if (strcmp(experiment_mode, "cold") == 0)
+    else if (strcmp(experiment_mode, "cold") == 0)
     {
         evict_relation();
     }
-
-    /*
-     * OFF
-     * Normal database behavior
-     */
-
-    if (strcmp(experiment_mode, "off") == 0)
+    else if (strcmp(experiment_mode, "off") == 0)
     {
-        elog(INFO, "Extension turned off");
+        elog(INFO, "Extension set to off");
     }
-
-    return pg_exec_run_prev_hook(queryDesc, direction, count, execute_once);
+    return result;
 }
 
 // Standard functions to init (load) and unload extensions using postgres hooks
 
 void _PG_init(void)
 {
-
     DefineCustomStringVariable(
         "experiment_mode",
         "Activate either cold or hot start.",
@@ -252,15 +249,12 @@ void _PG_init(void)
         NULL,
         NULL);
 
-    pg_exec_run_prev_hook = ExecutorRun_hook;
-
-    if (pg_exec_run_prev_hook == NULL)
-        pg_exec_run_prev_hook = standard_ExecutorRun;
-
-    ExecutorRun_hook = pg_query_pre_run_hook;
+    prev_planner_hook = planner_hook;
+    planner_hook = pg_query_planner_hook;
 }
 
+// Modify _PG_fini to unset the planner hook
 void _PG_fini(void)
 {
-    ExecutorRun_hook = pg_exec_run_prev_hook;
+    planner_hook = prev_planner_hook;
 }
