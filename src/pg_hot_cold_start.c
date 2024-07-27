@@ -14,9 +14,9 @@
 PG_MODULE_MAGIC;
 #endif
 
+extern ProcNumber MyProcNumber;
 extern Oid MyDatabaseId;
 extern Oid MyDatabaseTableSpace;
-extern ProcNumber MyProcNumber;
 
 /* GUC Variable */
 static char *experiment_mode = NULL;
@@ -45,7 +45,7 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
      * For relations, check if node represents a sequential scan. If so, retrieve the
      * relOid and stores it in a list (oidList).
      *
-     * For indexes, check for the type of index and retrieve its ID over the scan.id. Store this in the oidList.
+     * For indexes, check for the type of index and retrieve its relation ID over the scan.id. Store this in the oidList.
      *
      * The oidList is later passed to the prewarm function for further processing.
      */
@@ -77,7 +77,7 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
         IndexScan *indexScan = (IndexScan *)planTree;
         indexOid = indexScan->indexid;
 
-        // Get relations from index
+        /* Get relations from index */
         rte = list_nth(query->rtable, indexScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from index scan: %d", rte->eref->aliasname, indexOid);
@@ -89,7 +89,7 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
         BitmapIndexScan *bitmapIndexScan = (BitmapIndexScan *)planTree;
         bitOid = bitmapIndexScan->indexid;
 
-        // Get relations from bitmap index
+        /* Get relations from bitmap index */
         rte = list_nth(query->rtable, bitmapIndexScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from Bitmap index: %d", rte->eref->aliasname, bitOid);
@@ -101,7 +101,7 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
         IndexOnlyScan *indexOnlyScan = (IndexOnlyScan *)planTree;
         indexOnlyOid = indexOnlyScan->indexid;
 
-        // Get relations from index only scan index
+        /* Get relations from index only scan index*/
         rte = list_nth(query->rtable, indexOnlyScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from index only scan: %d", rte->eref->aliasname, indexOnlyOid);
@@ -110,12 +110,12 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
     }
     default:
     {
-        // Skip unhandled scans
+        /* Skip unhandled scans */
         break;
     }
     }
 
-    /* Recursively walk through the tree and its children, pass the List */
+    /* Iterate through plan , pass the OID list to be filled */
     get_relations_from_plan(query, planTree->lefttree, oidList);
     get_relations_from_plan(query, planTree->righttree, oidList);
 }
@@ -133,48 +133,49 @@ static void prewarm_relations(unsigned int relOid)
 
     rel = relation_open(relOid, AccessShareLock);
 
-    // Get the number of blocks of the relation
+    /* Number of bloX per relation */
     nblocks = RelationGetNumberOfBlocks(rel);
 
-    elog(INFO, "Number of blocks in relation: %u / %u", nblocks, MaxBlockNumber);
+    elog(INFO, "Relation Size: %u MB/ %u MB", nblocks * 8 / 1024, MaxBlockNumber * 8 / 1024);
 
     for (blkno = 0; blkno < nblocks; blkno++)
     {
-        // Read the buffer to prewarm it
+        /* Read the buffer to prewarm it */
         buf = ReadBuffer(rel, blkno);
 
-        // Release the buffer
         ReleaseBuffer(buf);
     }
 
-    // Close the relation
     relation_close(rel, AccessShareLock);
 }
 
 /*
 static void evict_relation(unsigned int relOid)
 {
-    SMgrRelation smgr_reln;
-    SMgrRelation smgr_relns[1];  // Create an array of SMgrRelation pointers
-    RelFileLocator rfl;
+    Relation rel;
+    RelFileLocator relFileLocator;
+    SMgrRelation smgr = NULL;
 
-    rfl.relNumber = relOid;
-    rfl.dbOid = MyDatabaseId;
-    rfl.spcOid = MyDatabaseTableSpace;
+    relFileLocator.relNumber = relOid;
+    relFileLocator.dbOid = MyDatabaseId;
+    relFileLocator.spcOid = MyDatabaseTableSpace;
 
-    smgr_reln = smgropen(rfl, MyProcNumber);
-    smgr_relns[0] = smgr_reln;  // Add the SMgrRelation to the array
+    rel = relation_open(relOid, AccessShareLock);
 
-    elog(INFO, "Evict relaation with OID: %d from table %d and tablespace %d", rfl.relNumber, rfl.dbOid, rfl.spcOid);
+    smgr = smgropen(relFileLocator, MyProcNumber);
 
-    DropRelationsAllBuffers(smgr_relns, 1);  // Pass the array instead of the single pointer
+    for (ForkNumber forkNum = 0; forkNum <= MAX_FORKNUM; ++forkNum)
+    {
+        DropRelationBuffers(smgr, &forkNum, 4, 0);
+    }
 
-    smgrclose(smgr_reln);
+    relation_close(rel, AccessShareLock);
 }
 */
 
-static void evict_relation()
+static void evict_relations()
 {
+    FlushDatabaseBuffers(MyDatabaseId);
     elog(INFO, "Emptied buffer for database: %d", MyDatabaseId);
     DropDatabaseBuffers(MyDatabaseId);
 }
@@ -224,7 +225,7 @@ pg_query_planner_hook(Query *parse, int cursorOptions, const char *query_string,
     }
     else if (strcmp(experiment_mode, "cold") == 0)
     {
-        evict_relation();
+        evict_relations();
     }
     else if (strcmp(experiment_mode, "off") == 0)
     {
