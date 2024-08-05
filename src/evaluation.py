@@ -370,22 +370,22 @@ def main():
     query_names, execution_times_hot, hits_hot, reads_hot, total_execution_time_hot = connect_to_db(db_params,
                                                                                                     sql_files,
                                                                                                     "hot")
-    """visualize_execution_time_stacked(query_names, execution_times_cold,
+    visualize_execution_time_stacked(query_names, execution_times_cold,
                              execution_times_hot,
                              execution_times_off)
 
     visualize_data_buffer_stacked(query_names, hits_cold, reads_cold,
                            hits_hot, reads_hot,
-                           hits_off, reads_off)"""
+                           hits_off, reads_off)
     
-    visualize_execution_time(query_names, execution_times_cold, hits_cold, reads_cold,
+    """visualize_execution_time(query_names, execution_times_cold, hits_cold, reads_cold,
                              execution_times_hot,
                              execution_times_off,
                              total_execution_time_off, total_execution_time_cold, total_execution_time_hot)
     
     visualize_data_buffer(query_names,hits_cold, reads_cold,
                           hits_hot, reads_hot,
-                          hits_off, reads_off)
+                          hits_off, reads_off)"""
 
 
 
