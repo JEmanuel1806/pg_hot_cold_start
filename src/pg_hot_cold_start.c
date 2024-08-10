@@ -21,7 +21,6 @@ extern Oid MyDatabaseTableSpace;
 /* GUC Variable */
 static char *experiment_mode = NULL;
 
-/* Used Hook */
 static planner_hook_type prev_planner_hook = NULL;
 
 /* Traverse query plan tree and get all relevant relations */
@@ -72,16 +71,27 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
         *oidList = lappend_oid(*oidList, relOid);
         break;
     }
+    case T_TidScan:
+    {
+        Scan *scan = (Scan *)planTree;
+        rte = list_nth(query->rtable, scan->scanrelid - 1);
+        relOid = rte->relid;
+
+        elog(INFO, "TID Scan with relation: %s", rte->eref->aliasname);
+        *oidList = lappend_oid(*oidList, relOid);
+        break;
+    }
     case T_IndexScan:
     {
         IndexScan *indexScan = (IndexScan *)planTree;
         indexOid = indexScan->indexid;
 
-        /* Get relations from index */
+        // Get relations from index
         rte = list_nth(query->rtable, indexScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from index scan: %d", rte->eref->aliasname, indexOid);
         *oidList = lappend_oid(*oidList, relOid);
+        *oidList = lappend_oid(*oidList, indexOid);
         break;
     }
     case T_BitmapIndexScan:
@@ -89,10 +99,11 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
         BitmapIndexScan *bitmapIndexScan = (BitmapIndexScan *)planTree;
         bitOid = bitmapIndexScan->indexid;
 
-        /* Get relations from bitmap index */
+        /* Get relations from bitmap indx */
         rte = list_nth(query->rtable, bitmapIndexScan->scan.scanrelid - 1);
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from Bitmap index: %d", rte->eref->aliasname, bitOid);
+        *oidList = lappend_oid(*oidList, bitOid);
         *oidList = lappend_oid(*oidList, relOid);
         break;
     }
@@ -106,6 +117,7 @@ static void get_relations_from_plan(Query *query, Plan *planTree, List **oidList
         relOid = rte->relid;
         elog(INFO, "Scanning relation: %s from index only scan: %d", rte->eref->aliasname, indexOnlyOid);
         *oidList = lappend_oid(*oidList, relOid);
+        *oidList = lappend_oid(*oidList, indexOnlyOid);
         break;
     }
     default:
@@ -129,18 +141,16 @@ static void prewarm_relations(unsigned int relOid)
     BlockNumber nblocks;
     Buffer buf;
 
-    // elog(INFO, "Prewarming Relation: %s", NameStr(RelationIdGetRelation(relOid)->rd_rel->relname));
-
     rel = relation_open(relOid, AccessShareLock);
 
-    /* Number of bloX per relation */
+    /* Number of blocks per relation */
     nblocks = RelationGetNumberOfBlocks(rel);
 
     elog(INFO, "Relation Size: %u MB/ %u MB", nblocks * 8 / 1024, MaxBlockNumber * 8 / 1024);
 
     for (blkno = 0; blkno < nblocks; blkno++)
     {
-        /* Read the buffer to prewarm it */
+        /* Read the bufer to prewarm it */
         buf = ReadBuffer(rel, blkno);
 
         ReleaseBuffer(buf);
@@ -149,41 +159,16 @@ static void prewarm_relations(unsigned int relOid)
     relation_close(rel, AccessShareLock);
 }
 
-/*
-static void evict_relation(unsigned int relOid)
-{
-    Relation rel;
-    RelFileLocator relFileLocator;
-    SMgrRelation smgr = NULL;
-
-    relFileLocator.relNumber = relOid;
-    relFileLocator.dbOid = MyDatabaseId;
-    relFileLocator.spcOid = MyDatabaseTableSpace;
-
-    rel = relation_open(relOid, AccessShareLock);
-
-    smgr = smgropen(relFileLocator, MyProcNumber);
-
-    for (ForkNumber forkNum = 0; forkNum <= MAX_FORKNUM; ++forkNum)
-    {
-        DropRelationBuffers(smgr, &forkNum, 4, 0);
-    }
-
-    relation_close(rel, AccessShareLock);
-}
-*/
-
 static void evict_relations()
 {
     FlushDatabaseBuffers(MyDatabaseId);
-    elog(INFO, "Emptied buffer for database: %d", MyDatabaseId);
     DropDatabaseBuffers(MyDatabaseId);
 }
 
 static PlannedStmt *
 pg_query_planner_hook(Query *parse, int cursorOptions, const char *query_string, ParamListInfo boundParams)
 {
-    // Call the previous planner hook if it exists, otherwise call standard_planner
+    // Call the previous planer hook if it exists, otherwise call standard_planner
     PlannedStmt *result = NULL;
 
     if (prev_planner_hook)
@@ -223,10 +208,22 @@ pg_query_planner_hook(Query *parse, int cursorOptions, const char *query_string,
             prewarm_relations(list_nth_oid(oidList, i));
         }
     }
+
+    /*
+     * COLD START
+     * Evict the relations from the buffer cache
+     */
+
     else if (strcmp(experiment_mode, "cold") == 0)
     {
         evict_relations();
     }
+
+    /*
+     * Extension disabled
+     * Do nothing
+     */
+
     else if (strcmp(experiment_mode, "off") == 0)
     {
         elog(INFO, "Extension set to off");
@@ -243,7 +240,7 @@ void _PG_init(void)
         "Activate either cold or hot start.",
         NULL,
         &experiment_mode,
-        "cold", /* default value */
+        "hot", /* default value */
         PGC_SUSET,
         0,
         NULL,
@@ -254,7 +251,6 @@ void _PG_init(void)
     planner_hook = pg_query_planner_hook;
 }
 
-// Modify _PG_fini to unset the planner hook
 void _PG_fini(void)
 {
     planner_hook = prev_planner_hook;
